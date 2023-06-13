@@ -18,18 +18,18 @@ from mlc_llm import utils
 
 def _parse_args():
     args = argparse.ArgumentParser()
-    utils.argparse_add_common(args)
+    args.add_argument("--local-id", type=str, required=True)
     args.add_argument("--device-name", type=str, default="auto")
     args.add_argument("--debug-dump", action="store_true", default=False)
     args.add_argument("--artifact-path", type=str, default="dist")
     args.add_argument("--prompt", type=str, default="The capital of Canada is")
     args.add_argument("--profile", action="store_true", default=False)
     parsed = args.parse_args()
-    parsed.model_path = os.path.join(parsed.artifact_path, "models", parsed.model)
-    parsed.artifact_path = os.path.join(
-        parsed.artifact_path, parsed.model, parsed.dtype
-    )
+    parsed.model, parsed.quantization = parsed.local_id.rsplit("-", 1)
     utils.argparse_postproc_common(parsed)
+    parsed.artifact_path = os.path.join(
+        parsed.artifact_path, f"{parsed.model}-{parsed.quantization.name}"
+    )
     return parsed
 
 
@@ -85,12 +85,15 @@ def deploy_to_pipeline(args) -> None:
     const_params = utils.load_params(args.artifact_path, device)
     ex = tvm.runtime.load_module(
         os.path.join(
-            args.artifact_path, f"{args.model}_{args.device_name}_{args.dtype}.so"
+            args.artifact_path,
+            f"{args.model}-{args.quantization.name}-{args.device_name}.so",
         )
     )
     vm = relax.VirtualMachine(ex, device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(args.artifact_path, "params"), trust_remote_code=True
+    )
 
     print("Tokenizing...")
     inputs = tvm.nd.array(
@@ -103,8 +106,8 @@ def deploy_to_pipeline(args) -> None:
     kv_caches = vm["create_kv_cache"]()
     # skip warm up
 
-    logits, kv_caches = vm["encoding"](inputs, seq_len_shape, kv_caches, const_params)
-    logits, kv_caches = vm["decoding"](
+    logits, kv_caches = vm["prefill"](inputs, seq_len_shape, kv_caches, const_params)
+    logits, kv_caches = vm["decode"](
         first_sampled_token, second_seq_len_shape, kv_caches, const_params
     )
     device.sync()
@@ -112,10 +115,10 @@ def deploy_to_pipeline(args) -> None:
     kv_caches = vm["create_kv_cache"]()
     print("Running inference...")
     start = time.time()
-    logits, kv_caches = vm["encoding"](inputs, seq_len_shape, kv_caches, const_params)
+    logits, kv_caches = vm["prefill"](inputs, seq_len_shape, kv_caches, const_params)
     device.sync()
     encoding_end = time.time()
-    logits, kv_caches = vm["decoding"](
+    logits, kv_caches = vm["decode"](
         first_sampled_token, second_seq_len_shape, kv_caches, const_params
     )
     device.sync()
@@ -136,7 +139,7 @@ def deploy_to_pipeline(args) -> None:
         print("Profiling...")
         kv_caches = vm["create_kv_cache"]()
 
-        logits, kv_caches = vm["encoding"](
+        logits, kv_caches = vm["prefill"](
             inputs, seq_len_shape, kv_caches, const_params
         )
         print("======================= Encoding Profiling =======================")
@@ -148,7 +151,7 @@ def deploy_to_pipeline(args) -> None:
         )
         cmp_instrument.time_eval_results.clear()
 
-        logits, kv_caches = vm["decoding"](
+        logits, kv_caches = vm["decode"](
             first_sampled_token, second_seq_len_shape, kv_caches, const_params
         )
         print("======================= Decoding Profiling =======================")

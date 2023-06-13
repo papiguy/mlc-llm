@@ -1,12 +1,16 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import tvm
 from tvm import relax, te
 from tvm.relax.testing import nn
 from tvm.script import relax as R
+
+from ..utils import load_torch_pname2binname_map
+from .commons import create_metadata_func
+from .modules import ModuleList, named_parameters
 
 
 @dataclass
@@ -46,12 +50,6 @@ class LlamaConfig:
         self.tie_word_embeddings = tie_word_embeddings
         self.position_embedding_base = position_embedding_base
         self.kwargs = kwargs
-
-
-MODEL_CONFIG = {
-    "vicuna-v1-7b": {},
-    "llama-7b": {},
-}
 
 
 class Linear(nn.Module):
@@ -307,10 +305,17 @@ class LlamaAttention(nn.Module):
             attention_mask.struct_info.shape.values,
             (bsz, tvm.tir.IntImm("int64", 1), q_len, kv_seq_len),
         )
-        
-        attn_weights = nn.emit(maximum(attn_weights, relax.const(tvm.tir.min_value(attn_weights.struct_info.dtype).value, attn_weights.struct_info.dtype)))
-        attn_weights = nn.emit(relax.op.minimum(attn_weights, attention_mask))
 
+        attn_weights = nn.emit(
+            maximum(
+                attn_weights,
+                relax.const(
+                    tvm.tir.min_value(attn_weights.struct_info.dtype).value,
+                    attn_weights.struct_info.dtype,
+                ),
+            )
+        )
+        attn_weights = nn.emit(relax.op.minimum(attn_weights, attention_mask))
 
         # upcast attention to fp32
         if attn_weights.struct_info.dtype != "float32":
@@ -394,7 +399,7 @@ def _make_causal_mask(input_ids_shape, dtype, src_len):
     from tvm.relax.op import broadcast_to, full, triu
 
     bsz, tgt_len = input_ids_shape
-    
+
     def min_max_triu_te():
         return te.compute(
             (tgt_len, tgt_len),
@@ -403,7 +408,7 @@ def _make_causal_mask(input_ids_shape, dtype, src_len):
             ),
             name="make_diag_mask_te",
         )
-    
+
     mask = nn.emit_te(min_max_triu_te)
     diag_mask = nn.emit(broadcast_to(mask, (bsz, 1, tgt_len, tgt_len)))
     if src_len == tgt_len:
@@ -413,7 +418,9 @@ def _make_causal_mask(input_ids_shape, dtype, src_len):
         return te.compute(
             (bsz, 1, tgt_len, src_len),
             lambda b, _, i, j: te.if_then_else(
-                j < src_len - tgt_len, tvm.tir.max_value(dtype), x[b, _, i, j - (src_len - tgt_len)]
+                j < src_len - tgt_len,
+                tvm.tir.max_value(dtype),
+                x[b, _, i, j - (src_len - tgt_len)],
             ),
             name="concat_te",
         )
@@ -429,9 +436,9 @@ class LlamaModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, dtype=config.dtype
         )
-        self.layers = [
-            LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)
-        ]
+        self.layers = ModuleList(
+            [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
         self.norm = LlamaRMSNorm(
             config.hidden_size, dtype=config.dtype, eps=config.rms_norm_eps
         )
@@ -446,7 +453,13 @@ class LlamaModel(nn.Module):
             # Get src_len from input parameters
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             bsz, tgt_len = input_shape
-            combined_attention_mask = nn.emit(relax.op.full((bsz, 1, tgt_len, src_len), relax.const(tvm.tir.max_value(dtype).value, dtype), dtype))
+            combined_attention_mask = nn.emit(
+                relax.op.full(
+                    (bsz, 1, tgt_len, src_len),
+                    relax.const(tvm.tir.max_value(dtype).value, dtype),
+                    dtype,
+                )
+            )
         return combined_attention_mask
 
     def forward(
@@ -503,15 +516,14 @@ class LlamaForCausalLM(nn.Module):
         ############ Rotary embedding constants ############
         assert config.hidden_size % config.num_attention_heads == 0
         head_dim = config.hidden_size // config.num_attention_heads
+
+        # Hardcode the cached sin/cos for 2048.
+        # This will be eliminated further with online rotary embedding calculation.
         self.cos_cached = nn.Parameter(
-            (config.max_sequence_length, head_dim),
-            dtype=config.dtype,
-            name="cos_cached",
+            (2048, head_dim), dtype=config.dtype, name="cos_cached"
         )
         self.sin_cached = nn.Parameter(
-            (config.max_sequence_length, head_dim),
-            dtype=config.dtype,
-            name="sin_cached",
+            (2048, head_dim), dtype=config.dtype, name="sin_cached"
         )
         ############ End ############
 
@@ -545,11 +557,12 @@ class LlamaForCausalLM(nn.Module):
         return logits, key_value_cache
 
 
-def create_encoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
+def create_encoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> Dict[int, str]:
     bsz = 1
     seq_len = tvm.tir.Var("n", "int64")
     all_seq_len = tvm.tir.Var("m", "int64")
-    with bb.function("encoding"):
+    pidx2pname: Dict[int, str] = {}
+    with bb.function("prefill"):
         model = LlamaForCausalLM(config)
         input_ids = nn.Placeholder((bsz, seq_len), dtype="int32", name="input_ids")
         all_seq_len_shape = relax.Var(
@@ -570,19 +583,28 @@ def create_encoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
                 all_seq_len_shape,
                 past_key_values,
             ] + model.parameters()
+
+            named_params = named_parameters(model)
+            for i, (name, param) in enumerate(list(named_params.items())[:-2]):
+                pidx2pname[i] = name
+                assert param.same_as(params[i + 3])
+                assert not name.startswith("sin") and not name.startswith("cos")
+
             gv = bb.emit_output((logits, relax.Tuple(key_value_cache)))
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
-    gv = mod.get_global_var("encoding")
+    gv = mod.get_global_var("prefill")
     bb.update_func(gv, mod[gv].with_attr("num_input", 3))
+
+    return pidx2pname
 
 
 def create_decoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
     bsz = 1
     all_seq_len = tvm.tir.Var("n", "int64")
 
-    with bb.function("decoding"):
+    with bb.function("decode"):
         model = LlamaForCausalLM(config)
         input_ids = nn.Placeholder((bsz, 1), dtype="int32", name="input_ids")
         all_seq_len_shape = relax.Var(
@@ -607,7 +629,7 @@ def create_decoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
         bb.emit_func_output(gv, params)
 
     mod = bb.get()
-    gv = mod.get_global_var("decoding")
+    gv = mod.get_global_var("decode")
     bb.update_func(gv, mod[gv].with_attr("num_input", 3))
 
 
@@ -638,45 +660,49 @@ def create_kv_cache_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
         bb.emit_func_output(gv)
 
 
-def get_model(args):
-    from transformers import AutoModelForCausalLM  # type: ignore[import]
+def create_softmax_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
+    with bb.function("softmax_with_temperature"):
+        logits = nn.Placeholder(
+            (1, 1, config.vocab_size), dtype="float32", name="logits"
+        )
+        temperature = nn.Placeholder((), dtype="float32", name="temperature")
+        with bb.dataflow():
+            div = bb.emit(relax.op.divide(logits, temperature))
+            softmax = bb.emit(relax.op.nn.softmax(div, axis=-1))
+            gv = bb.emit_output(softmax)
+        bb.emit_func_output(gv, [logits, temperature])
 
+
+def get_model(args, hf_config):
     model_name = args.model
     model_path = args.model_path
-    dtype = args.dtype
+    dtype = args.quantization.model_dtype
     max_seq_len = args.max_seq_len
 
-    if model_name.startswith("vicuna-") or model_name.startswith("llama-"):
-        config = LlamaConfig(**MODEL_CONFIG[model_name], dtype=dtype)
+    if (
+        model_name.startswith("vicuna-")
+        or model_name.startswith("llama-")
+        or model_name.startswith("open-llama-")
+        or model_name.startswith("gorilla-")
+    ):
+        config = LlamaConfig(**hf_config, dtype=dtype)
         if max_seq_len != -1:
             config.max_sequence_length = max_seq_len
 
         bb = relax.BlockBuilder()
-        create_encoding_func(bb, config)
+        pidx2pname = create_encoding_func(bb, config)
         create_decoding_func(bb, config)
         create_kv_cache_func(bb, config)
-        mod = bb.get()
-
-        param_list = []
-        device = tvm.cpu()
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path)
-        for _, param in hf_model.named_parameters():
-            param_list.append(
-                tvm.nd.array(param.detach().cpu().numpy().astype(config.dtype), device)
-            )
-        del hf_model
-        head_dim = config.hidden_size / config.num_attention_heads
-        inv_freq = 1.0 / (
-            config.position_embedding_base
-            ** (np.arange(0, head_dim, 2).astype("float32") / head_dim)
+        create_softmax_func(bb, config)
+        create_metadata_func(
+            bb,
+            model_name=model_name,
+            max_window_size=config.max_sequence_length,
+            stop_tokens=[2],
+            add_prefix_space=False,
         )
 
-        t = np.arange(config.max_sequence_length, dtype=inv_freq.dtype)
-        freqs = np.einsum("i,j->ij", t, inv_freq)
-        emb = np.concatenate((freqs, freqs), axis=-1)
-        param_list.append(tvm.nd.array(np.cos(emb).astype(config.dtype), device))
-        param_list.append(tvm.nd.array(np.sin(emb).astype(config.dtype), device))
-
+        mod = bb.get()
         for gv in mod.functions:
             func = mod[gv]
             if isinstance(func, relax.Function):
@@ -687,6 +713,37 @@ def get_model(args):
                         "m": config.max_sequence_length,
                     },
                 )
+
+        pname2binname = load_torch_pname2binname_map(
+            model_path, set(pidx2pname.values())
+        )
+
+        device = tvm.cpu()
+
+        param_list = [None] * len(pidx2pname)
+        assert len(param_list) == len(pidx2pname)
+
+        head_dim = config.hidden_size / config.num_attention_heads
+        inv_freq = 1.0 / (
+            config.position_embedding_base
+            ** (np.arange(0, head_dim, 2).astype("float32") / head_dim)
+        )
+
+        # Hardcode the cached sin/cos for 2048.
+        # This will be eliminated further with online rotary embedding calculation.
+        t = np.arange(2048, dtype=inv_freq.dtype)
+        freqs = np.einsum("i,j->ij", t, inv_freq)
+        emb = np.concatenate((freqs, freqs), axis=-1)
+        param_list.append(tvm.nd.array(np.cos(emb).astype(config.dtype), device))
+        param_list.append(tvm.nd.array(np.sin(emb).astype(config.dtype), device))
+
+        args.pidx2pname = pidx2pname
+        args.pname2binname = pname2binname
+        args.f_convert_pname_fwd = lambda pname: pname
+        args.f_convert_param_bkwd = lambda torch_pname, raw_param: [
+            (torch_pname, raw_param.astype(dtype))
+        ]
+
         return mod, param_list
 
     raise ValueError(f"Unsupported model: {model_name}")

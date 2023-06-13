@@ -1,27 +1,26 @@
 # pylint: disable=missing-docstring,too-few-public-methods,too-many-instance-attributes,invalid-name,too-many-locals,too-many-arguments
+import argparse
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import tvm
 from tvm import relax, te
 from tvm.relax.op import (
     astype,
     broadcast_to,
-    full,
     matmul,
     maximum,
     minimum,
     permute_dims,
     reshape,
     squeeze,
-    triu,
 )
 from tvm.relax.op.nn import gelu, softmax
 from tvm.relax.testing import nn
-from tvm.runtime import NDArray
 from tvm.script import relax as R
 
+from ..utils import load_torch_pname2binname_map
+from .commons import create_metadata_func
 from .modules import (
     Embedding,
     LayerNorm,
@@ -32,71 +31,36 @@ from .modules import (
 )
 
 
-@dataclass
 class GPTNeoXConfig:  # pylint: disable=too-many-instance-attributes
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_attention_heads: int
-    num_hidden_layers: int
-    dtype: str = "float32"
-    layer_norm_eps: float = 1e-05
-    max_sequence_length: int = 2048
-    rotary_emb_base: int = 10000
-    rotary_pct: float = 0.25
-
-
-MODEL_CONFIG = {
-    "dolly-v2-3b": {
-        "hidden_size": 2560,
-        "intermediate_size": 10240,
-        "num_attention_heads": 32,
-        "num_hidden_layers": 32,
-        "vocab_size": 50280,
-    },
-    "dolly-v2-7b": {
-        "hidden_size": 4096,
-        "intermediate_size": 16384,
-        "num_attention_heads": 32,
-        "num_hidden_layers": 32,
-        "vocab_size": 50280,
-    },
-    "dolly-v2-12b": {
-        "hidden_size": 5120,
-        "intermediate_size": 20480,
-        "num_attention_heads": 40,
-        "num_hidden_layers": 36,
-        "vocab_size": 50280,
-    },
-    "stablelm-tuned-alpha-3b": {
-        "hidden_size": 4096,
-        "intermediate_size": 16384,
-        "num_attention_heads": 32,
-        "num_hidden_layers": 16,
-        "vocab_size": 50688,
-    },
-    "stablelm-tuned-alpha-7b": {
-        "hidden_size": 6144,
-        "intermediate_size": 24576,
-        "num_attention_heads": 48,
-        "num_hidden_layers": 16,
-        "vocab_size": 50432,
-    },
-}
-
-
-def _min_value(dtype) -> relax.Expr:
-    v = tvm.tir.min_value(dtype).value
-    if dtype == "float16":
-        v = -55504.0
-    return relax.const(v, dtype)
-
-
-def _max_value(dtype) -> relax.Expr:
-    v = tvm.tir.max_value(dtype).value
-    if dtype == "float16":
-        v = 55504.0
-    return relax.const(v, dtype)
+    def __init__(
+        self,
+        use_parallel_residual,
+        hidden_size,
+        intermediate_size,
+        num_attention_heads,
+        num_hidden_layers,
+        vocab_size,
+        rotary_pct,
+        rotary_emb_base,
+        layer_norm_eps,
+        max_sequence_length,
+        dtype,
+        ffn_out_dtype,
+        **kwargs,
+    ):
+        self.use_parallel_residual = use_parallel_residual
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_attention_heads = num_attention_heads
+        self.num_hidden_layers = num_hidden_layers
+        self.vocab_size = vocab_size
+        self.rotary_pct = rotary_pct
+        self.rotary_emb_base = rotary_emb_base
+        self.layer_norm_eps = layer_norm_eps
+        self.max_sequence_length = max_sequence_length
+        self.dtype = dtype
+        self.ffn_out_dtype = ffn_out_dtype
+        self.kwargs = kwargs
 
 
 class GPTNeoXAttention(nn.Module):
@@ -207,7 +171,15 @@ class GPTNeoXAttention(nn.Module):
             )
         )
         # Apply attention mask
-        attn_weights = nn.emit(maximum(attn_weights, relax.const(tvm.tir.min_value(attn_weights.struct_info.dtype).value, attn_weights.struct_info.dtype)))
+        attn_weights = nn.emit(
+            maximum(
+                attn_weights,
+                relax.const(
+                    tvm.tir.min_value(attn_weights.struct_info.dtype).value,
+                    attn_weights.struct_info.dtype,
+                ),
+            )
+        )
         attn_weights = nn.emit(minimum(attn_weights, attention_mask))
         # Calculate Softmax(QK)
         if attn_weights.struct_info.dtype != "float32":
@@ -233,19 +205,36 @@ class GPTNeoXMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         dtype: str,
+        out_dtype: Optional[str],
     ):
         super().__init__()
-        self.dense_h_to_4h = Linear(hidden_size, intermediate_size, dtype)
-        self.dense_4h_to_h = Linear(intermediate_size, hidden_size, dtype)
+        if out_dtype is None:
+            out_dtype = dtype
+        self.dense_h_to_4h = Linear(
+            hidden_size,
+            intermediate_size,
+            dtype=dtype,
+            out_dtype=out_dtype,
+        )
+        self.dense_4h_to_h = Linear(
+            intermediate_size,
+            hidden_size,
+            dtype=dtype,
+            out_dtype=out_dtype,
+        )
         self.dtype = dtype
 
     def forward(self, hidden_states):
         if hidden_states.struct_info.dtype != self.dtype:
             hidden_states = nn.emit(astype(hidden_states, self.dtype))
         hidden_states = self.dense_h_to_4h(hidden_states)
-        hidden_states = gelu(hidden_states)
+        hidden_states = nn.emit(gelu(hidden_states))
+        if hidden_states.struct_info.dtype != self.dtype:
+            hidden_states = nn.emit(astype(hidden_states, self.dtype))
         hidden_states = self.dense_4h_to_h(hidden_states)
-        return nn.emit(hidden_states)
+        if hidden_states.struct_info.dtype != self.dtype:
+            hidden_states = nn.emit(astype(hidden_states, self.dtype))
+        return hidden_states
 
 
 class GPTNeoXLayer(nn.Module):
@@ -255,8 +244,10 @@ class GPTNeoXLayer(nn.Module):
         intermediate_size: int,
         layer_norm_eps: float,
         num_heads: int,
+        use_parallel_residual: bool,
         rotary_embedding: RotaryEmbedding,
         dtype: str,
+        ffn_out_dtype: Optional[str],
     ):
         self.input_layernorm = LayerNorm(
             hidden_size,
@@ -275,8 +266,12 @@ class GPTNeoXLayer(nn.Module):
             dtype=dtype,
         )
         self.mlp = GPTNeoXMLP(
-            hidden_size, intermediate_size=intermediate_size, dtype=dtype
+            hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            out_dtype=ffn_out_dtype,
         )
+        self.use_parallel_residual = use_parallel_residual
         self.dtype = dtype
 
     def forward(
@@ -287,15 +282,21 @@ class GPTNeoXLayer(nn.Module):
         attention_mask: Optional[relax.Expr] = None,
     ):
         attn_input = self.input_layernorm(hidden_states)
-        mlp_input = self.post_attention_layernorm(hidden_states)
         attn_output, present_key_value = self.attention(
             attn_input,
             all_seq_len_shape,
             past_key_value,
             attention_mask,
         )
-        mlp_output = self.mlp(mlp_input)
-        hidden_states = nn.emit(mlp_output + attn_output + hidden_states)
+        if self.use_parallel_residual:
+            mlp_input = self.post_attention_layernorm(hidden_states)
+            mlp_output = self.mlp(mlp_input)
+            hidden_states = nn.emit(mlp_output + attn_output + hidden_states)
+        else:
+            attn_output = nn.emit(attn_output + hidden_states)
+            mlp_input = self.post_attention_layernorm(attn_output)
+            mlp_output = self.mlp(mlp_input)
+            hidden_states = nn.emit(astype(mlp_output, self.dtype) + attn_output)
         return hidden_states, present_key_value
 
 
@@ -304,6 +305,7 @@ def _prepare_decoder_attention_mask(input_shape, src_len, dtype):
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
     if isinstance(input_shape[-1], tvm.tir.Var) or input_shape[-1] > 1:
         bsz, tgt_len = input_shape
+
         def min_max_triu_te():
             return te.compute(
                 (tgt_len, tgt_len),
@@ -312,7 +314,7 @@ def _prepare_decoder_attention_mask(input_shape, src_len, dtype):
                 ),
                 name="make_diag_mask_te",
             )
-    
+
         mask = nn.emit_te(min_max_triu_te)
         diag_mask = nn.emit(broadcast_to(mask, (bsz, 1, tgt_len, tgt_len)))
         if src_len == tgt_len:
@@ -322,7 +324,9 @@ def _prepare_decoder_attention_mask(input_shape, src_len, dtype):
             return te.compute(
                 (bsz, 1, tgt_len, src_len),
                 lambda b, _, i, j: te.if_then_else(
-                    j < src_len - tgt_len, tvm.tir.max_value(dtype), x[b, _, i, j - (src_len - tgt_len)]
+                    j < src_len - tgt_len,
+                    tvm.tir.max_value(dtype),
+                    x[b, _, i, j - (src_len - tgt_len)],
                 ),
                 name="concat_te",
             )
@@ -332,7 +336,11 @@ def _prepare_decoder_attention_mask(input_shape, src_len, dtype):
         # Get src_len from input parameters
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         bsz, tgt_len = input_shape
-        mask = relax.op.full((bsz, 1, tgt_len, src_len), relax.const(tvm.tir.max_value(dtype).value, dtype), dtype)
+        mask = relax.op.full(
+            (bsz, 1, tgt_len, src_len),
+            relax.const(tvm.tir.max_value(dtype).value, dtype),
+            dtype,
+        )
     return nn.emit(mask)
 
 
@@ -362,7 +370,9 @@ class GPTNeoXModel(nn.Module):
                     layer_norm_eps=config.layer_norm_eps,
                     num_heads=config.num_attention_heads,
                     rotary_embedding=rotary_embedding,
+                    use_parallel_residual=config.use_parallel_residual,
                     dtype=config.dtype,
+                    ffn_out_dtype=config.ffn_out_dtype,
                 )
                 for _ in range(config.num_hidden_layers)
             ]
@@ -453,12 +463,12 @@ class GPTNeoXForCausalLM(nn.Module):
 def create_encoding_func(
     bb: relax.BlockBuilder,
     config: GPTNeoXConfig,
-    ordered_params: List[str],
-) -> None:
+) -> Dict[int, str]:
     batch_size = tvm.tir.IntImm("int64", 1)
     seq_len = tvm.tir.Var("n", "int64")
     all_seq_len = tvm.tir.Var("m", "int64")
-    with bb.function("encoding"):
+    pidx2pname: Dict[int, str] = {}
+    with bb.function("prefill"):
         model = GPTNeoXForCausalLM(config)
         input_ids = nn.Placeholder(
             (batch_size, seq_len), dtype="int32", name="input_ids"
@@ -482,26 +492,29 @@ def create_encoding_func(
                 input_ids,
                 all_seq_len_shape,
                 past_key_values,
-            ]
+            ] + model.parameters()
             named_params = named_parameters(model)
-            for name in ordered_params:
-                params.append(named_params[name])
+            for i, (name, param) in enumerate(named_params.items()):
+                pidx2pname[i] = name
+                assert param.same_as(params[i + 3])
+
             gv = bb.emit_output((logits, relax.Tuple(key_value_cache)))
         bb.emit_func_output(gv, params)
     mod = bb.get()
-    gv = mod.get_global_var("encoding")
+    gv = mod.get_global_var("prefill")
     bb.update_func(gv, mod[gv].with_attr("num_input", 3))
+
+    return pidx2pname
 
 
 def create_decoding_func(
     bb: relax.BlockBuilder,
     config: GPTNeoXConfig,
-    ordered_params: List[str],
 ) -> None:
     batch_size = tvm.tir.IntImm("int64", 1)
     seq_len = tvm.tir.IntImm("int64", 1)
     all_seq_len = tvm.tir.Var("n", "int64")
-    with bb.function("decoding"):
+    with bb.function("decode"):
         model = GPTNeoXForCausalLM(config)
         input_ids = nn.Placeholder(
             (batch_size, seq_len), dtype="int32", name="input_ids"
@@ -526,14 +539,11 @@ def create_decoding_func(
                 input_ids,
                 all_seq_len_shape,
                 past_key_values,
-            ]
-            named_params = named_parameters(model)
-            for name in ordered_params:
-                params.append(named_params[name])
+            ] + model.parameters()
             gv = bb.emit_output((logits, relax.Tuple(key_value_cache)))
         bb.emit_func_output(gv, params)
     mod = bb.get()
-    gv = mod.get_global_var("decoding")
+    gv = mod.get_global_var("decode")
     bb.update_func(gv, mod[gv].with_attr("num_input", 3))
 
 
@@ -543,7 +553,7 @@ def create_kv_cache_func(
 ) -> None:
     init_shape = relax.ShapeExpr(
         (
-            1,
+            config.max_sequence_length,
             config.num_attention_heads,
             config.hidden_size // config.num_attention_heads,
         )
@@ -567,71 +577,128 @@ def create_kv_cache_func(
         bb.emit_func_output(gv)
 
 
-def get_model(
-    model_name: str,
-    model_path: str,
-    dtype: str,
-):
-    from transformers import AutoModelForCausalLM  # type: ignore[import]
+def create_softmax_func(bb: relax.BlockBuilder, config: GPTNeoXConfig) -> None:
+    with bb.function("softmax_with_temperature"):
+        logits = nn.Placeholder(
+            (1, 1, config.vocab_size), dtype="float32", name="logits"
+        )
+        temperature = nn.Placeholder((), dtype="float32", name="temperature")
+        with bb.dataflow():
+            div = bb.emit(relax.op.divide(logits, temperature))
+            softmax = bb.emit(relax.op.nn.softmax(div, axis=-1))
+            gv = bb.emit_output(softmax)
+        bb.emit_func_output(gv, [logits, temperature])
 
-    if model_name.startswith("dolly-") or model_name.startswith("stablelm-"):
-        config = GPTNeoXConfig(**MODEL_CONFIG[model_name], dtype=dtype)
-        num_heads = config.num_attention_heads
-        hidden_size = config.hidden_size
-        head_dim = hidden_size // num_heads
-        param_list: List[Tuple[str, NDArray]] = []
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path)
-        for name, param in hf_model.named_parameters():
-            param = param.detach().cpu().numpy()
-            if param.dtype == "float32":
-                if "layernorm" in name or "layer_norm" in name or "embed_out" in name:
-                    param = param.astype("float32")
-                else:
-                    param = param.astype(dtype)
-            if name.endswith("query_key_value.weight"):
-                name = name.replace("query_key_value.weight", "{}_proj.weight")
-                assert param.ndim == 2
-                param = param.reshape(num_heads, 3, head_dim, hidden_size)
-                q = param[:, 0, :, :].reshape(hidden_size, hidden_size)
-                k = param[:, 1, :, :].reshape(hidden_size, hidden_size)
-                v = param[:, 2, :, :].reshape(hidden_size, hidden_size)
-                param_list.append((name.format("q"), q))
-                param_list.append((name.format("k"), k))
-                param_list.append((name.format("v"), v))
-            elif name.endswith("query_key_value.bias"):
-                name = name.replace("query_key_value.bias", "{}_proj.bias")
-                assert param.ndim == 1
-                param = param.reshape(num_heads, 3, head_dim)
-                q = param[:, 0, :].reshape(hidden_size)
-                k = param[:, 1, :].reshape(hidden_size)
-                v = param[:, 2, :].reshape(hidden_size)
-                param_list.append((name.format("q"), q))
-                param_list.append((name.format("k"), k))
-                param_list.append((name.format("v"), v))
-            else:
-                param_list.append((name, param))
-        del hf_model
-        param_list = [
-            (
-                name,
-                tvm.nd.array(param, tvm.cpu()),
+
+def get_model(
+    args: argparse.Namespace,
+    hf_config,
+):
+    model = args.model
+    dtype = args.quantization.model_dtype
+    ffn_out_dtype = "float32"
+
+    if model.startswith("dolly-"):
+        stop_tokens = [2]
+        ffn_out_dtype = "float16"
+    elif model.startswith("stablelm-"):
+        stop_tokens = [50278, 50279, 50277, 1, 0]
+        ffn_out_dtype = "float16"
+    elif model.lower().startswith("redpajama-"):
+        stop_tokens = [0]
+    else:
+        raise ValueError(f"Unsupported model {model}")
+
+    config = GPTNeoXConfig(
+        **hf_config,
+        max_sequence_length=args.max_seq_len if args.max_seq_len != -1 else 2048,
+        dtype=dtype,
+        ffn_out_dtype=ffn_out_dtype,
+    )
+
+    bb = relax.BlockBuilder()
+    pidx2pname = create_encoding_func(bb, config)
+    create_decoding_func(bb, config)
+    create_kv_cache_func(bb, config)
+    create_softmax_func(bb, config)
+    create_metadata_func(
+        bb,
+        model_name=model,
+        max_window_size=config.max_sequence_length,
+        stop_tokens=stop_tokens,
+        add_prefix_space=False,
+    )
+    mod = bb.get()
+    for gv in mod.functions:
+        func = mod[gv]
+        if isinstance(func, relax.Function):
+            mod[gv] = func.with_attr(
+                "tir_var_upper_bound",
+                {
+                    "n": config.max_sequence_length,
+                    "m": config.max_sequence_length,
+                },
             )
-            for name, param in param_list
-        ]
-        bb = relax.BlockBuilder()
-        create_encoding_func(bb, config, [k for k, _ in param_list])
-        create_decoding_func(bb, config, [k for k, _ in param_list])
-        create_kv_cache_func(bb, config)
-        mod = bb.get()
-        for gv in mod.functions:
-            func = mod[gv]
-            if isinstance(func, relax.Function):
-                mod[gv] = func.with_attr(
-                    "tir_var_upper_bound",
-                    {
-                        "n": config.max_sequence_length,
-                        "m": config.max_sequence_length,
-                    },
-                )
-        return mod, [v for _, v in param_list]
-    raise ValueError(f"Unsupported model: {model_name}")
+
+    def f_convert_pname_fwd(pname: str) -> str:
+        import re  # pylint: disable=import-outside-toplevel
+
+        str_pattern = re.compile(r"(q|k|v)_proj")
+        if re.search(str_pattern, pname) is not None:
+            return str_pattern.sub("query_key_value", pname)
+        else:
+            return pname
+
+    pname2binname = load_torch_pname2binname_map(
+        args.model_path, set(pidx2pname.values()), f_convert_pname_fwd
+    )
+
+    num_heads = config.num_attention_heads
+    hidden_size = config.hidden_size
+    head_dim = hidden_size // num_heads
+
+    def f_convert_param_bkwd(torch_pname: str, raw_param):
+        # raw_param: numpy.ndarray
+        if torch_pname.endswith("query_key_value.weight"):
+            assert raw_param.ndim == 2
+            raw_param = raw_param.astype(dtype).reshape(
+                num_heads, 3, head_dim, hidden_size
+            )
+            q_weight = raw_param[:, 0, :, :].reshape(hidden_size, hidden_size)
+            k_weight = raw_param[:, 1, :, :].reshape(hidden_size, hidden_size)
+            v_weight = raw_param[:, 2, :, :].reshape(hidden_size, hidden_size)
+            return [
+                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+            ]
+        elif torch_pname.endswith("query_key_value.bias"):
+            assert raw_param.ndim == 1
+            raw_param = raw_param.astype(dtype).reshape(num_heads, 3, head_dim)
+            q_bias = raw_param[:, 0, :].reshape(hidden_size)
+            k_bias = raw_param[:, 1, :].reshape(hidden_size)
+            v_bias = raw_param[:, 2, :].reshape(hidden_size)
+            return [
+                (torch_pname.replace("query_key_value", "q_proj"), q_bias),
+                (torch_pname.replace("query_key_value", "k_proj"), k_bias),
+                (torch_pname.replace("query_key_value", "v_proj"), v_bias),
+            ]
+        elif (
+            "layernorm" in torch_pname
+            or "layer_norm" in torch_pname
+            or "embed_out" in torch_pname
+        ):
+            return [(torch_pname, raw_param.astype("float32"))]
+        elif (
+            ".dense_h_to_4h.bias" in torch_pname or ".dense_4h_to_h.bias" in torch_pname
+        ):
+            return [(torch_pname, raw_param.astype(ffn_out_dtype))]
+        else:
+            return [(torch_pname, raw_param.astype(dtype))]
+
+    args.pidx2pname = pidx2pname
+    args.pname2binname = pname2binname
+    args.f_convert_pname_fwd = f_convert_pname_fwd
+    args.f_convert_param_bkwd = f_convert_param_bkwd
+
+    return mod, [None] * len(pidx2pname)

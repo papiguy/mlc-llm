@@ -285,8 +285,6 @@ class GroupQuantize:
             assert sym
         if mode == "int3":
             assert sym
-        if storage_nbit == 16:
-            assert mode == "int3"
         self.group_size = group_size
         self.sym = sym
         self.mode = mode
@@ -393,7 +391,11 @@ class GroupQuantize:
                         quantized_permute_dims = self.builder_.emit(
                             relax.op.permute_dims(quantized_permute_dims)
                         )
-                    return relax.op.matmul(call.args[0], quantized_permute_dims)
+                    return relax.op.matmul(
+                        call.args[0],
+                        quantized_permute_dims,
+                        out_dtype=call.attrs.out_dtype,
+                    )
                 return call
 
             def quantize_take(self, call: relax.Call):

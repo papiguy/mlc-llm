@@ -33,6 +33,8 @@ if (MLC_LLM_INSTALL_STATIC_LIB)
   set(BUILD_STATIC_RUNTIME ON)
 endif()
 
+option(BUILD_CPP_TEST "Build cpp unittests" OFF)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # tvm runtime config: minimize runtime components
@@ -44,25 +46,13 @@ set(USE_AOT_EXECUTOR OFF)
 set(USE_PROFILER OFF)
 set(USE_GTEST OFF)
 set(USE_LIBBACKTRACE OFF)
-add_subdirectory($ENV{TVM_HOME} tvm EXCLUDE_FROM_ALL)
-
-# sentencepiece config
-option(SPM_ENABLE_SHARED "override sentence piece config" OFF)
-option(SPM_ENABLE_TCMALLOC "" OFF)
-
+set(BUILD_DUMMY_LIBTVM ON)
+set(TVM_HOME 3rdparty/tvm)
+add_subdirectory(${TVM_HOME} tvm EXCLUDE_FROM_ALL)
 
 set(MLC_LLM_RUNTIME_LINKER_LIB "")
-# provide macro if it does not exist in cmake system
-# it is OK to skip those since we do not provide these apps in the ios
-# instead just link to the sentencepiece directly
-if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
-  macro (set_xcode_property TARGET XCODE_PROPERTY XCODE_VALUE)
-      set_property (TARGET ${TARGET} PROPERTY
-          XCODE_ATTRIBUTE_${XCODE_PROPERTY} ${XCODE_VALUE})
-  endmacro (set_xcode_property)
-endif()
-add_subdirectory(3rdparty/sentencepiece-js/sentencepiece sentencepiece EXCLUDE_FROM_ALL)
-add_subdirectory(3rdparty/tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
+set(TOKENZIER_CPP_PATH 3rdparty/tokenizers-cpp)
+add_subdirectory(${TOKENZIER_CPP_PATH} tokenizers EXCLUDE_FROM_ALL)
 
 
 tvm_file_glob(GLOB_RECURSE MLC_LLM_SRCS cpp/*.cc)
@@ -74,58 +64,88 @@ add_library(mlc_cli_objs OBJECT ${MLC_CLI_SRCS})
 
 set(
   MLC_LLM_INCLUDES
-  $ENV{TVM_HOME}/include
-  $ENV{TVM_HOME}/3rdparty/dlpack/include
-  $ENV{TVM_HOME}/3rdparty/dmlc-core/include
+  ${TVM_HOME}/include
+  ${TVM_HOME}/3rdparty/dlpack/include
+  ${TVM_HOME}/3rdparty/dmlc-core/include
+  ${TVM_HOME}/3rdparty/picojson
 )
 
 set(MLC_LLM_COMPILE_DEFS DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
 
 target_include_directories(mlc_llm_objs PRIVATE ${MLC_LLM_INCLUDES})
 target_compile_definitions(mlc_llm_objs PRIVATE ${MLC_LLM_COMPILE_DEFS})
-target_include_directories(mlc_llm_objs PRIVATE 3rdparty/sentencepiece-js/sentencepiece/src)
-target_include_directories(mlc_llm_objs PRIVATE 3rdparty/tokenizers-cpp)
+target_include_directories(mlc_llm_objs PRIVATE ${TOKENZIER_CPP_PATH}/include)
 target_compile_definitions(mlc_llm_objs PRIVATE -DMLC_LLM_EXPORTS)
 
 add_library(mlc_llm SHARED $<TARGET_OBJECTS:mlc_llm_objs>)
 add_library(mlc_llm_static STATIC $<TARGET_OBJECTS:mlc_llm_objs>)
-add_dependencies(mlc_llm_static sentencepiece-static tokenizers tvm_runtime)
+add_dependencies(mlc_llm_static tokenizers_cpp sentencepiece-static tokenizers_c tvm_runtime)
 set_target_properties(mlc_llm_static PROPERTIES OUTPUT_NAME mlc_llm)
 
 target_link_libraries(mlc_llm PUBLIC tvm_runtime)
-target_link_libraries(mlc_llm PRIVATE sentencepiece)
-# note: somehow cmake needs to specify the dependency twice
-target_link_libraries(mlc_llm PRIVATE tokenizers)
+target_link_libraries(mlc_llm PRIVATE tokenizers_cpp)
 
-# Exmaple app that may depends on mlc_llm
+if (BUILD_CPP_TEST)
+  message(STATUS "Building cpp unittests")
+  add_subdirectory(3rdparty/googletest)
+  file(GLOB_RECURSE MLC_LLM_TEST_SRCS ${PROJECT_SOURCE_DIR}/tests/cpp/*unittest.cc)
+  add_executable(mlc_llm_cpp_tests ${MLC_LLM_TEST_SRCS})
+  target_include_directories(mlc_llm_cpp_tests PRIVATE ${MLC_LLM_INCLUDES})
+  target_include_directories(mlc_llm_cpp_tests PRIVATE ${PROJECT_SOURCE_DIR}/cpp)
+  target_include_directories(mlc_llm_cpp_tests PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
+  target_link_libraries(mlc_llm_cpp_tests PUBLIC mlc_llm gtest gtest_main)
+endif(BUILD_CPP_TEST)
+
+# Example app that may depends on mlc_llm
 add_executable(mlc_chat_cli $<TARGET_OBJECTS:mlc_cli_objs>)
-target_link_libraries(mlc_chat_cli PUBLIC mlc_llm)
 target_include_directories(mlc_cli_objs PRIVATE ${MLC_LLM_INCLUDES})
 target_include_directories(mlc_cli_objs PRIVATE 3rdparty/argparse/include)
 target_compile_definitions(mlc_cli_objs PRIVATE ${MLC_LLM_COMPILE_DEFS})
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+  target_link_libraries(mlc_llm PRIVATE log)
+  target_link_libraries(mlc_chat_cli PRIVATE log)
+endif()
+
+if (MLC_LLM_INSTALL_STATIC_LIB)
+  target_link_libraries(
+    mlc_chat_cli PRIVATE mlc_llm_static tokenizers_cpp sentencepiece-static tokenizers_c)
+  target_link_libraries(
+    mlc_chat_cli PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,tvm_runtime>")
+else()
+  target_link_libraries(mlc_chat_cli PUBLIC mlc_llm)
+endif()
+
+add_library(mlc_llm_module SHARED $<TARGET_OBJECTS:mlc_llm_objs>)
+target_link_libraries(mlc_llm_module PUBLIC tvm)
+target_link_libraries(mlc_llm_module PRIVATE tokenizers_cpp)
 
 # when this option is on,
 # we install all static lib deps into lib
 if (MLC_LLM_INSTALL_STATIC_LIB)
   install(TARGETS
     mlc_llm_static
+    tokenizers_cpp
     sentencepiece-static
     tvm_runtime
     LIBRARY DESTINATION lib${LIB_SUFFIX}
     )
   # tokenizers need special handling as it builds from rust
   if(MSVC)
-    install(FILES ${CMAKE_BINARY_DIR}/tokenizers/libtokenizers_cpp.lib
+    install(FILES ${CMAKE_BINARY_DIR}/tokenizers/libtokenizers_c.lib
       DESTINATION lib${LIB_SUFFIX}
       )
   else()
-    install(FILES ${CMAKE_BINARY_DIR}/tokenizers/libtokenizers_cpp.a
+    install(FILES ${CMAKE_BINARY_DIR}/tokenizers/libtokenizers_c.a
       DESTINATION lib${LIB_SUFFIX}
       )
   endif()
 else()
-  install(TARGETS mlc_chat_cli tvm_runtime mlc_llm
-    RUNTIME_DEPENDENCY_SET tokenizers
+  install(TARGETS mlc_chat_cli tvm_runtime mlc_llm mlc_llm_module
+    mlc_llm_static
+    tokenizers_cpp
+    sentencepiece-static
+    RUNTIME_DEPENDENCY_SET tokenizers_c
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib${LIB_SUFFIX}
   )
